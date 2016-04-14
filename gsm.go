@@ -7,16 +7,18 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/tarm/goserial"
 )
 
 type Modem struct {
-	OOB   chan Packet
-	Debug bool
-	port  io.ReadWriteCloser
-	rx    chan Packet
-	tx    chan string
+	OOB     chan Packet
+	Debug   bool
+	port    io.ReadWriteCloser
+	rx      chan Packet
+	tx      chan string
+	timeout int //in second
 }
 
 var OpenPort = func(config *serial.Config) (io.ReadWriteCloser, error) {
@@ -34,12 +36,14 @@ func Open(config *serial.Config, debug bool) (*Modem, error) {
 	oob := make(chan Packet, 16)
 	rx := make(chan Packet)
 	tx := make(chan string)
+	timeout := 3
 	modem := &Modem{
-		OOB:   oob,
-		Debug: debug,
-		port:  port,
-		rx:    rx,
-		tx:    tx,
+		OOB:     oob,
+		Debug:   debug,
+		port:    port,
+		rx:      rx,
+		tx:      tx,
+		timeout: timeout,
 	}
 	// run send/receive goroutine
 	go modem.listen()
@@ -126,10 +130,10 @@ func lineChannel(r io.Reader) chan string {
 	go func() {
 		buffer := bufio.NewReader(r)
 		for {
-			line, _ := buffer.ReadString(10)
+			line, _ := buffer.ReadString(128)
 			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
-				continue
+				//continue
 			}
 			ret <- line
 		}
@@ -220,12 +224,17 @@ func parsePacket(status string, header string, body string) Packet {
 }
 
 func (self *Modem) listen() {
+	log.Println("LISTEN")
 	in := lineChannel(self.port)
 	var echo, last, header, body string
+	var second = time.Now().Unix()
+	log.Println(time.Now)
+
 	for {
 		select {
 		case line := <-in:
 			if line == echo {
+				log.Println("ECHO")
 				continue // ignore echo of command
 			} else if last != "" && startsWith(line, last) {
 				if header != "" {
@@ -247,15 +256,17 @@ func (self *Modem) listen() {
 				// raw mode for body
 			} else {
 				// OOB packet
+				log.Println("parse")
 				p := parsePacket("OK", line, "")
 				if p != nil {
 					self.OOB <- p
 				}
 			}
 		case line := <-self.tx:
+			log.Println("TX" + line)
 			m := reQuestion.FindStringSubmatch(line)
 			if len(m) > 0 {
-				last = m[1]
+				last = strings.TrimPrefix(m[1], "+")
 			}
 			echo = strings.TrimRight(line, "\r\n")
 			self.port.Write([]byte(line))
@@ -279,54 +290,50 @@ func (self *Modem) sendBody(cmd string, body string, args ...interface{}) (Packe
 	if _, e := response.(ERROR); e {
 		return response, errors.New("Response was ERROR")
 	}
+
+	log.Println(response)
+
 	return response, nil
 }
 
 func (self *Modem) send(cmd string, args ...interface{}) (Packet, error) {
 	self.tx <- formatCommand(cmd, args...)
-	response := <-self.rx
-	if _, e := response.(ERROR); e {
-		return response, errors.New("Response was ERROR")
+
+	timeStart = time.Now().Unix()
+
+	for {
+		select {
+		case response := <-self.rx:
+			if _, e := response.(ERROR); e {
+				return response, errors.New("Response was ERROR")
+			}
+		case <-time.After(time.Second * modem.timeout):
+			return response, errors.New("Wait Response timeout!!")
+		default:
+			//Checks timeOut here
+			log.Println("Wait response")
+		}
 	}
+
+	log.Println(response)
+
 	return response, nil
 }
 
 func (self *Modem) init() error {
 	// clear settings
-	if _, err := self.send("Z"); err != nil {
+	println("===init===")
+	if _, err := self.send("+FACT"); err != nil {
+		log.Println("ERR")
 		return err
 	}
 	log.Println("Reset")
-	// turn off echo
-	if _, err := self.send("E0"); err != nil {
-		return err
-	}
-	log.Println("Echo off")
-	// use combined storage (MT)
-	msg, err := self.send("+CPMS", "SM", "SM", "SM")
-	if err != nil {
-		return err
-	}
-	sinfo := msg.(StorageInfo)
-	log.Printf("Set SMS Storage: %d/%d used\n", sinfo.UsedSpace1, sinfo.MaxSpace1)
-	// set SMS text mode - easiest to implement. Ignore response which is
-	// often a benign error.
-	self.send("+CMGF", 1)
 
-	log.Println("Set SMS text mode")
-	// get SMSC
-	// the modem complains if SMSC hasn't been set, but stores it correctly, so
-	// query for stored value, then send a set from the query response.
-	r, err := self.send("+CSCA?")
-	if err != nil {
+	if _, err := self.send("+FCT"); err != nil {
+		log.Println("ERR")
 		return err
 	}
-	smsc := r.(SMSCAddress)
-	log.Println("Got SMSC:", smsc.Args)
-	r, err = self.send("+CSCA", smsc.Args...)
-	if err != nil {
-		return err
-	}
-	log.Println("Set SMSC to:", smsc.Args)
+	log.Println("Test")
+
 	return nil
 }
