@@ -130,7 +130,7 @@ func lineChannel(r io.Reader) chan string {
 	go func() {
 		buffer := bufio.NewReader(r)
 		for {
-			line, _ := buffer.ReadString(128)
+			line, _ := buffer.ReadString('\n')
 			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
 				//continue
@@ -153,66 +153,19 @@ func parsePacket(status string, header string, body string) Packet {
 	}
 
 	ls := strings.SplitN(header, ":", 2)
+
+	log.Println("PARSE:", ls[0], "-", ls[1])
+
 	if len(ls) != 2 {
 		return UnknownPacket{header, []interface{}{}}
 	}
 	uargs := strings.TrimSpace(ls[1])
 	args := unquotes(uargs)
 	switch ls[0] {
-	case "+ZUSIMR":
+	case "FACT":
 		// message storage unset nag, ignore
-		return nil
-	case "+ZPASR":
-		return ServiceStatus{args[0].(string)}
-	case "+ZDONR":
-		return NetworkStatus{args[0].(string)}
-	case "+CMTI":
-		return MessageNotification{args[0].(string), args[1].(int)}
-	case "+CSCA":
-		return SMSCAddress{args}
-	case "+CMGR":
-		return Message{Status: args[0].(string), Telephone: args[1].(string),
-			Timestamp: parseTime(args[3].(string)), Body: body}
-	case "+CMGL":
-		return Message{
-			Index:     args[0].(int),
-			Status:    args[1].(string),
-			Telephone: args[2].(string),
-			Timestamp: parseTime(args[4].(string)),
-			Body:      body,
-			Last:      status != "",
-		}
-	case "+CPMS":
-		s := uargs
-		if strings.HasPrefix(s, "(") {
-			// query response
-			// ("A","B","C"),("A","B","C"),("A","B","C")
-			s = strings.TrimPrefix(s, "(")
-			s = strings.TrimSuffix(s, ")")
-			areas := strings.SplitN(s, "),(", 3)
-			return StorageAreas{
-				stringsUnquotes(areas[0]),
-				stringsUnquotes(areas[1]),
-				stringsUnquotes(areas[2]),
-			}
-		} else {
-			// set response
-			// 0,100,0,100,0,100
-			// get ints
-			var iargs []int
-			for _, arg := range args {
-				if iarg, ok := arg.(int); ok {
-					iargs = append(iargs, iarg)
-				}
-			}
-			if len(iargs) != 6 {
-				break
-			}
-
-			return StorageInfo{
-				iargs[0], iargs[1], iargs[2], iargs[3], iargs[4], iargs[5],
-			}
-		}
+		log.Println("FACK RESPONSE:", args)
+		return OK{}
 	case "":
 		if status == "OK" {
 			return OK{}
@@ -227,23 +180,20 @@ func (self *Modem) listen() {
 	log.Println("LISTEN")
 	in := lineChannel(self.port)
 	var echo, last, header, body string
-	var second = time.Now().Unix()
 	log.Println(time.Now)
 
 	for {
 		select {
 		case line := <-in:
+			log.Println("GET_RESPONSE:", line)
 			if line == echo {
-				log.Println("ECHO")
+				log.Println("ECHO BACK")
 				continue // ignore echo of command
 			} else if last != "" && startsWith(line, last) {
-				if header != "" {
-					// first of multiple responses (eg CMGL)
-					packet := parsePacket("", header, body)
-					self.rx <- packet
-				}
-				header = line
-				body = ""
+				// first of multiple responses (eg CMGL)
+				packet := parsePacket("", line, "")
+				self.rx <- packet
+				log.Println("-------")
 			} else if line == "OK" || line == "ERROR" {
 				packet := parsePacket(line, header, body)
 				self.rx <- packet
@@ -256,17 +206,17 @@ func (self *Modem) listen() {
 				// raw mode for body
 			} else {
 				// OOB packet
-				log.Println("parse")
 				p := parsePacket("OK", line, "")
 				if p != nil {
 					self.OOB <- p
 				}
 			}
 		case line := <-self.tx:
-			log.Println("TX" + line)
+			log.Println("SEND_CMD:" + line)
 			m := reQuestion.FindStringSubmatch(line)
 			if len(m) > 0 {
 				last = strings.TrimPrefix(m[1], "+")
+				log.Println("LAST CMD:", last)
 			}
 			echo = strings.TrimRight(line, "\r\n")
 			self.port.Write([]byte(line))
@@ -298,24 +248,17 @@ func (self *Modem) sendBody(cmd string, body string, args ...interface{}) (Packe
 
 func (self *Modem) send(cmd string, args ...interface{}) (Packet, error) {
 	self.tx <- formatCommand(cmd, args...)
+	var response Packet
 
-	timeStart = time.Now().Unix()
-
-	for {
-		select {
-		case response := <-self.rx:
-			if _, e := response.(ERROR); e {
-				return response, errors.New("Response was ERROR")
-			}
-		case <-time.After(time.Second * modem.timeout):
-			return response, errors.New("Wait Response timeout!!")
-		default:
-			//Checks timeOut here
-			log.Println("Wait response")
+	select {
+	case response := <-self.rx:
+		log.Println(response)
+		return response, nil
+	case <-time.After(time.Second * time.Duration(self.timeout)):
+		{
+			return nil, errors.New("Wait Response timeout!!")
 		}
 	}
-
-	log.Println(response)
 
 	return response, nil
 }
@@ -324,14 +267,13 @@ func (self *Modem) init() error {
 	// clear settings
 	println("===init===")
 	if _, err := self.send("+FACT"); err != nil {
-		log.Println("ERR")
-		return err
+		log.Println("ERR", err)
 	}
+
 	log.Println("Reset")
 
 	if _, err := self.send("+FCT"); err != nil {
 		log.Println("ERR")
-		return err
 	}
 	log.Println("Test")
 
